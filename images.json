@@ -1,0 +1,7 @@
+[
+  {
+    "source": "ghcr.io/miracleeverywhere/dst-management-platform-api:latest",
+    "target": "dst-management-platform-api:latest",
+    "description": "饥荒dmp镜像包"
+  }
+]
