@@ -1,30 +1,29 @@
-name: Sync Docker Images
+name: Sync Container Images
 
 on:
-  # 允许在 GitHub Actions 页面手动运行
+  # 允许在 Actions 页面手动执行
   workflow_dispatch:
 
-  # 定时同步
+  # 定时执行，GitHub Actions cron 使用 UTC
   schedule:
-    # GitHub Actions 使用 UTC 时间
-    # UTC 19:00 = 北京时间次日凌晨 03:00
-    - cron: "0 19 * * *"
+    # UTC 19:17 = 北京时间次日 03:17
+    - cron: "17 19 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  # 避免定时任务和手动任务同时运行
-  group: docker-image-sync
+  # 避免定时任务与手动任务重叠
+  group: container-image-sync
   cancel-in-progress: false
 
 jobs:
   prepare:
-    name: Read image configuration
+    name: Prepare sync matrix
     runs-on: ubuntu-latest
 
     outputs:
-      matrix: ${{ steps.images.outputs.matrix }}
+      matrix: ${{ steps.matrix.outputs.value }}
 
     steps:
       - name: Checkout repository
@@ -36,108 +35,78 @@ jobs:
 
           jq empty images.json
 
-          if [ "$(jq 'length' images.json)" -eq 0 ]; then
-            echo "images.json 不能为空"
-            exit 1
-          fi
+          jq -e '
+            type == "array" and
+            length > 0 and
+            all(
+              .[];
+              type == "object" and
+              (.source | type == "string" and length > 0) and
+              (.target | type == "string" and length > 0)
+            )
+          ' images.json >/dev/null
 
+          # 禁止 target 携带路径前缀，避免绕过指定的 Docker Hub 用户名。
           jq -e '
             all(
               .[];
-              (.source | type == "string" and length > 0) and
-              (.target | type == "string" and length > 0) and
-              (.platforms | type == "string" and length > 0)
+              (.target | contains("/") | not)
             )
-          ' images.json > /dev/null
+          ' images.json >/dev/null
 
-      - name: Generate matrix
-        id: images
+      - name: Generate job matrix
+        id: matrix
         run: |
-          {
-            echo "matrix<<EOF"
-            jq -c '{include: .}' images.json
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          echo "value=$(jq -c '{include: .}' images.json)" >> "$GITHUB_OUTPUT"
 
   sync:
-    name: ${{ matrix.target }}
+    name: Sync ${{ matrix.target }}
     needs: prepare
     runs-on: ubuntu-latest
 
     strategy:
-      # 单个镜像失败时，继续同步其他镜像
+      # 一个镜像失败，不影响其他镜像继续同步
       fail-fast: false
+      max-parallel: 3
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Install Skopeo
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes skopeo
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Show mirror information
+      - name: Show sync information
         env:
           SOURCE_IMAGE: ${{ matrix.source }}
           TARGET_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.target }}
-          PLATFORMS: ${{ matrix.platforms }}
           DESCRIPTION: ${{ matrix.description }}
         run: |
           echo "Source:      ${SOURCE_IMAGE}"
           echo "Target:      ${TARGET_IMAGE}"
-          echo "Platforms:   ${PLATFORMS}"
-          echo "Description: ${DESCRIPTION}"
+          echo "Description: ${DESCRIPTION:-No description}"
 
-      - name: Create mirror Dockerfile
-        env:
-          SOURCE_IMAGE: ${{ matrix.source }}
-        run: |
-          cat > Dockerfile.mirror <<'EOF'
-          ARG SOURCE_IMAGE
-          FROM ${SOURCE_IMAGE}
-
-          ARG SOURCE_IMAGE
-          ARG DESCRIPTION
-          ARG SOURCE_REPOSITORY
-          ARG SYNC_TIME
-
-          LABEL org.opencontainers.image.title="Docker image mirror" \
-                org.opencontainers.image.description="${DESCRIPTION}" \
-                org.opencontainers.image.source="${SOURCE_REPOSITORY}" \
-                org.opencontainers.image.url="${SOURCE_REPOSITORY}" \
-                org.opencontainers.image.created="${SYNC_TIME}" \
-                io.github.image-mirror.upstream="${SOURCE_IMAGE}"
-          EOF
-
-      - name: Build and push mirror
+      - name: Copy all image architectures
         env:
           SOURCE_IMAGE: ${{ matrix.source }}
           TARGET_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.target }}
-          PLATFORMS: ${{ matrix.platforms }}
-          DESCRIPTION: ${{ matrix.description }}
-          SOURCE_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          SYNC_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          skopeo copy \
+            --all \
+            --retry-times 3 \
+            --dest-creds "${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}" \
+            "docker://${SOURCE_IMAGE}" \
+            "docker://${TARGET_IMAGE}"
 
-          docker buildx build \
-            --platform "${PLATFORMS}" \
-            --build-arg "SOURCE_IMAGE=${SOURCE_IMAGE}" \
-            --build-arg "DESCRIPTION=${DESCRIPTION}" \
-            --build-arg "SOURCE_REPOSITORY=${SOURCE_REPOSITORY}" \
-            --build-arg "SYNC_TIME=${SYNC_TIME}" \
-            --tag "${TARGET_IMAGE}" \
-            --file Dockerfile.mirror \
-            --provenance=false \
-            --push \
-            .
+      - name: Verify target image
+        env:
+          TARGET_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          skopeo inspect "docker://${TARGET_IMAGE}" >/dev/null
+          echo "Successfully verified: ${TARGET_IMAGE}"
